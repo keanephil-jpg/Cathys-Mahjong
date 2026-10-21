@@ -2,16 +2,21 @@
 
 /*
     CATHY'S MAHJONG
-    iPad-optimised version
+    Optimised iPad version
 
-    Improvements:
-    - Faster start-up
-    - No service-worker registration
-    - Direct pointer/touch controls
-    - Prevents duplicate touch and click events
-    - Automatic board fitting
-    - Solvable 144-tile deals
+    Main performance improvements:
+    1. Creates tile elements once per deal.
+    2. Does not rebuild all 144 tiles after every tap.
+    3. Uses one event handler for the entire board.
+    4. Reuses one AudioContext.
+    5. Caches the current free-tile state.
+    6. Updates only the tiles whose state has changed.
+    7. Sound starts off by default for maximum iPad performance.
 */
+
+// ============================================================
+// TILE SYMBOLS
+// ============================================================
 
 const SYMBOLS = [
     ...[
@@ -19,7 +24,8 @@ const SYMBOLS = [
         "🀌", "🀍", "🀎", "🀏"
     ].map(key => ({
         key,
-        colour: "red"
+        colour: "red",
+        group: null
     })),
 
     ...[
@@ -27,7 +33,8 @@ const SYMBOLS = [
         "🀕", "🀖", "🀗", "🀘"
     ].map(key => ({
         key,
-        colour: "green"
+        colour: "green",
+        group: null
     })),
 
     ...[
@@ -35,27 +42,34 @@ const SYMBOLS = [
         "🀞", "🀟", "🀠", "🀡"
     ].map(key => ({
         key,
-        colour: "blue"
+        colour: "blue",
+        group: null
     })),
 
     ...[
         "🀀", "🀁", "🀂", "🀃"
     ].map(key => ({
         key,
-        colour: "purple"
+        colour: "purple",
+        group: null
     })),
 
     {
         key: "🀄",
-        colour: "red"
+        colour: "red",
+        group: null
     },
+
     {
         key: "🀅",
-        colour: "green"
+        colour: "green",
+        group: null
     },
+
     {
         key: "🀆",
-        colour: "blue"
+        colour: "blue",
+        group: null
     },
 
     {
@@ -63,16 +77,19 @@ const SYMBOLS = [
         colour: "gold",
         group: "season"
     },
+
     {
         key: "🀧",
         colour: "gold",
         group: "season"
     },
+
     {
         key: "🀨",
         colour: "gold",
         group: "season"
     },
+
     {
         key: "🀩",
         colour: "gold",
@@ -84,22 +101,29 @@ const SYMBOLS = [
         colour: "purple",
         group: "flower"
     },
+
     {
         key: "🀣",
         colour: "purple",
         group: "flower"
     },
+
     {
         key: "🀤",
         colour: "purple",
         group: "flower"
     },
+
     {
         key: "🀥",
         colour: "purple",
         group: "flower"
     }
 ];
+
+// ============================================================
+// PAGE ELEMENTS
+// ============================================================
 
 const board = document.querySelector("#board");
 const statusElement = document.querySelector("#status");
@@ -116,51 +140,30 @@ const winWindow = document.querySelector("#win");
 const winText = document.querySelector("#winText");
 const playAgainButton = document.querySelector("#again");
 
+// ============================================================
+// GAME STATE
+// ============================================================
+
 let tiles = [];
 let solution = [];
-let selectedTileId = null;
 let history = [];
+
+let selectedTileId = null;
 let originalTileTypes = [];
-let soundEnabled = true;
+
+let freeTileIds = new Set();
+let tileElements = new Map();
+
 let boardLocked = false;
+let soundEnabled = false;
+let audioContext = null;
+
 let resizeTimer = null;
+let lastPointerTime = 0;
 
-/*
-    Remove any old service worker left behind by
-    previous versions of the game.
-*/
-
-async function removeOldOfflineCache() {
-    try {
-        if ("serviceWorker" in navigator) {
-            const registrations =
-                await navigator.serviceWorker.getRegistrations();
-
-            for (const registration of registrations) {
-                await registration.unregister();
-            }
-        }
-
-        if ("caches" in window) {
-            const cacheNames = await caches.keys();
-
-            await Promise.all(
-                cacheNames
-                    .filter(name =>
-                        name.includes("mahjong")
-                    )
-                    .map(name =>
-                        caches.delete(name)
-                    )
-            );
-        }
-    } catch (error) {
-        console.warn(
-            "Old cache could not be removed:",
-            error
-        );
-    }
-}
+// ============================================================
+// GENERAL UTILITIES
+// ============================================================
 
 function shuffle(array) {
     for (
@@ -168,10 +171,9 @@ function shuffle(array) {
         index > 0;
         index -= 1
     ) {
-        const randomIndex =
-            Math.floor(
-                Math.random() * (index + 1)
-            );
+        const randomIndex = Math.floor(
+            Math.random() * (index + 1)
+        );
 
         [
             array[index],
@@ -185,57 +187,114 @@ function shuffle(array) {
     return array;
 }
 
-function playTone(frequency = 600) {
-    if (!soundEnabled) return;
+function setStatus(message) {
+    statusElement.textContent = message;
+}
 
-    try {
-        const AudioClass =
+function updateCounters() {
+    const remainingTiles = tiles.reduce(
+        (total, tile) => {
+            return total + (
+                tile.removed ? 0 : 1
+            );
+        },
+        0
+    );
+
+    tilesLeftElement.textContent =
+        String(remainingTiles);
+
+    movesElement.textContent =
+        `Moves: ${history.length}`;
+}
+
+// ============================================================
+// AUDIO
+// ============================================================
+
+function getAudioContext() {
+    if (!soundEnabled) {
+        return null;
+    }
+
+    if (!audioContext) {
+        const AudioContextClass =
             window.AudioContext ||
             window.webkitAudioContext;
 
-        const audioContext =
-            new AudioClass();
+        if (!AudioContextClass) {
+            return null;
+        }
+
+        audioContext =
+            new AudioContextClass();
+    }
+
+    if (
+        audioContext.state === "suspended"
+    ) {
+        audioContext.resume().catch(() => {
+            // Sound is optional.
+        });
+    }
+
+    return audioContext;
+}
+
+function playTone(
+    frequency = 600,
+    duration = 0.09
+) {
+    if (!soundEnabled) {
+        return;
+    }
+
+    try {
+        const context =
+            getAudioContext();
+
+        if (!context) {
+            return;
+        }
 
         const oscillator =
-            audioContext.createOscillator();
+            context.createOscillator();
 
-        const volume =
-            audioContext.createGain();
+        const gain =
+            context.createGain();
 
-        oscillator.connect(volume);
-        volume.connect(audioContext.destination);
-
+        oscillator.type = "sine";
         oscillator.frequency.value =
             frequency;
 
-        volume.gain.setValueAtTime(
-            0.055,
-            audioContext.currentTime
+        gain.gain.setValueAtTime(
+            0.045,
+            context.currentTime
         );
 
-        volume.gain.exponentialRampToValueAtTime(
+        gain.gain.exponentialRampToValueAtTime(
             0.001,
-            audioContext.currentTime + 0.14
+            context.currentTime + duration
         );
 
-        oscillator.start();
+        oscillator.connect(gain);
+        gain.connect(context.destination);
+
+        oscillator.start(
+            context.currentTime
+        );
 
         oscillator.stop(
-            audioContext.currentTime + 0.14
+            context.currentTime + duration
         );
     } catch (error) {
-        // Sound is optional.
+        // Continue without sound.
     }
 }
 
-/*
-    Create 144 layered tile positions.
-
-    Layer 1: 96 tiles
-    Layer 2: 32 tiles
-    Layer 3: 12 tiles
-    Layer 4: 4 tiles
-*/
+// ============================================================
+// LAYERED BOARD LAYOUT
+// ============================================================
 
 function createLayout() {
     const positions = [];
@@ -246,18 +305,30 @@ function createLayout() {
             x,
             y,
             z,
+
             key: "",
             colour: "",
             group: null,
+
             removed: false
         });
     }
+
+    /*
+        Bottom layer: 96 tiles
+        12 columns × 8 rows
+    */
 
     for (let y = 0; y < 8; y += 1) {
         for (let x = 0; x < 12; x += 1) {
             addPosition(x, y, 0);
         }
     }
+
+    /*
+        Second layer: 32 tiles
+        8 columns × 4 rows
+    */
 
     for (let y = 0; y < 4; y += 1) {
         for (let x = 0; x < 8; x += 1) {
@@ -269,6 +340,11 @@ function createLayout() {
         }
     }
 
+    /*
+        Third layer: 12 tiles
+        4 columns × 3 rows
+    */
+
     for (let y = 0; y < 3; y += 1) {
         for (let x = 0; x < 4; x += 1) {
             addPosition(
@@ -278,6 +354,11 @@ function createLayout() {
             );
         }
     }
+
+    /*
+        Top layer: 4 tiles
+        2 columns × 2 rows
+    */
 
     for (let y = 0; y < 2; y += 1) {
         for (let x = 0; x < 2; x += 1) {
@@ -291,6 +372,10 @@ function createLayout() {
 
     return positions;
 }
+
+// ============================================================
+// TILE AVAILABILITY
+// ============================================================
 
 function tilesOverlap(tileA, tileB) {
     return (
@@ -309,62 +394,139 @@ function isTileFree(
         return false;
     }
 
-    const covered =
-        tileState.some(otherTile => {
-            return (
-                !otherTile.removed &&
-                otherTile.id !== tile.id &&
-                otherTile.z > tile.z &&
-                tilesOverlap(tile, otherTile)
-            );
-        });
+    let leftBlocked = false;
+    let rightBlocked = false;
+    let covered = false;
 
-    if (covered) {
-        return false;
+    for (
+        let index = 0;
+        index < tileState.length;
+        index += 1
+    ) {
+        const otherTile =
+            tileState[index];
+
+        if (
+            otherTile.removed ||
+            otherTile.id === tile.id
+        ) {
+            continue;
+        }
+
+        if (
+            otherTile.z > tile.z &&
+            tilesOverlap(
+                tile,
+                otherTile
+            )
+        ) {
+            covered = true;
+            break;
+        }
+
+        if (
+            otherTile.z !== tile.z
+        ) {
+            continue;
+        }
+
+        if (
+            Math.abs(
+                otherTile.y - tile.y
+            ) >= 0.85
+        ) {
+            continue;
+        }
+
+        if (
+            Math.abs(
+                otherTile.x + 1 -
+                tile.x
+            ) < 0.12
+        ) {
+            leftBlocked = true;
+        }
+
+        if (
+            Math.abs(
+                otherTile.x -
+                (tile.x + 1)
+            ) < 0.12
+        ) {
+            rightBlocked = true;
+        }
     }
 
-    const leftBlocked =
-        tileState.some(otherTile => {
-            return (
-                !otherTile.removed &&
-                otherTile.id !== tile.id &&
-                otherTile.z === tile.z &&
-                Math.abs(
-                    otherTile.y - tile.y
-                ) < 0.85 &&
-                Math.abs(
-                    otherTile.x + 1 - tile.x
-                ) < 0.12
-            );
-        });
-
-    const rightBlocked =
-        tileState.some(otherTile => {
-            return (
-                !otherTile.removed &&
-                otherTile.id !== tile.id &&
-                otherTile.z === tile.z &&
-                Math.abs(
-                    otherTile.y - tile.y
-                ) < 0.85 &&
-                Math.abs(
-                    otherTile.x -
-                    (tile.x + 1)
-                ) < 0.12
-            );
-        });
-
     return (
-        !leftBlocked ||
-        !rightBlocked
+        !covered &&
+        (
+            !leftBlocked ||
+            !rightBlocked
+        )
     );
 }
 
-/*
-    This creates a full legal removal route quickly.
-    It removes the first and last available tile at
-    every stage.
-*/
+function calculateFreeTiles(
+    tileState = tiles
+) {
+    const freeIds = new Set();
+
+    for (const tile of tileState) {
+        if (
+            isTileFree(
+                tile,
+                tileState
+            )
+        ) {
+            freeIds.add(tile.id);
+        }
+    }
+
+    return freeIds;
+}
+
+function refreshFreeTileState() {
+    freeTileIds =
+        calculateFreeTiles(tiles);
+
+    for (const tile of tiles) {
+        const element =
+            tileElements.get(tile.id);
+
+        if (
+            !element ||
+            tile.removed
+        ) {
+            continue;
+        }
+
+        const tileIsFree =
+            freeTileIds.has(tile.id);
+
+        element.classList.toggle(
+            "free",
+            tileIsFree
+        );
+
+        element.classList.toggle(
+            "blocked",
+            !tileIsFree
+        );
+
+        element.setAttribute(
+            "aria-label",
+            `${
+                tileIsFree
+                    ? "Free"
+                    : "Blocked"
+            } Mahjong tile`
+        );
+    }
+}
+
+// ============================================================
+// SOLVABLE DEAL GENERATION
+// ============================================================
 
 function createRemovalOrder(layout) {
     const workingTiles =
@@ -378,25 +540,36 @@ function createRemovalOrder(layout) {
         order.length <
         workingTiles.length / 2
     ) {
-        const available =
-            workingTiles.filter(tile =>
+        const freeTiles = [];
+
+        for (const tile of workingTiles) {
+            if (
                 isTileFree(
                     tile,
                     workingTiles
                 )
-            );
+            ) {
+                freeTiles.push(tile);
+            }
+        }
 
-        if (available.length < 2) {
+        if (freeTiles.length < 2) {
             throw new Error(
-                "The layout has no complete removal route."
+                "No complete removal route was found."
             );
         }
 
-        const firstTile = available[0];
+        /*
+            Pair tiles from opposite ends of the
+            currently accessible positions.
+        */
+
+        const firstTile =
+            freeTiles[0];
 
         const secondTile =
-            available[
-                available.length - 1
+            freeTiles[
+                freeTiles.length - 1
             ];
 
         firstTile.removed = true;
@@ -419,6 +592,10 @@ function createDeal() {
         createRemovalOrder(newTiles);
 
     const pairTypes = [];
+
+    /*
+        72 matching pairs produce 144 tiles.
+    */
 
     for (
         let pairNumber = 0;
@@ -445,12 +622,12 @@ function createDeal() {
             const tileType =
                 pairTypes[pairIndex];
 
-            pair.forEach(tileId => {
+            for (const tileId of pair) {
                 Object.assign(
                     newTiles[tileId],
                     tileType
                 );
-            });
+            }
         }
     );
 
@@ -479,6 +656,10 @@ function tilesMatch(tileA, tileB) {
     );
 }
 
+// ============================================================
+// BOARD SIZING
+// ============================================================
+
 function calculateBoardMetrics() {
     const rectangle =
         board.getBoundingClientRect();
@@ -495,6 +676,14 @@ function calculateBoardMetrics() {
             260
         );
 
+    const tileRatio = 1.28;
+
+    const horizontalLayerOffset =
+        0.12;
+
+    const verticalLayerOffset =
+        0.18;
+
     const horizontalPadding =
         Math.max(
             28,
@@ -507,68 +696,66 @@ function calculateBoardMetrics() {
             boardHeight * 0.085
         );
 
-    const tileRatio = 1.28;
-    const horizontalLayerOffset = 0.12;
-    const verticalLayerOffset = 0.18;
-
     let minimumX = Infinity;
     let maximumX = -Infinity;
     let minimumY = Infinity;
     let maximumY = -Infinity;
 
-    tiles.forEach(tile => {
-        const left =
+    for (const tile of tiles) {
+        const logicalLeft =
             tile.x +
             tile.z *
             horizontalLayerOffset;
 
-        const top =
-            tile.y * tileRatio -
+        const logicalTop =
+            tile.y -
             tile.z *
-            tileRatio *
             verticalLayerOffset;
 
         minimumX = Math.min(
             minimumX,
-            left
+            logicalLeft
         );
 
         maximumX = Math.max(
             maximumX,
-            left + 1
+            logicalLeft + 1
         );
 
         minimumY = Math.min(
             minimumY,
-            top
+            logicalTop
         );
 
         maximumY = Math.max(
             maximumY,
-            top + tileRatio
+            logicalTop + 1
         );
-    });
+    }
 
-    const layoutWidth =
+    const logicalWidth =
         maximumX - minimumX;
 
-    const layoutHeight =
+    const logicalHeight =
         maximumY - minimumY;
 
     const scaleByWidth =
         (
             boardWidth -
             horizontalPadding * 2
-        ) / layoutWidth;
+        ) / logicalWidth;
 
     const scaleByHeight =
         (
             boardHeight -
             verticalPadding * 2
-        ) / layoutHeight;
+        ) / (
+            logicalHeight *
+            tileRatio
+        );
 
     /*
-        Use 92% to preserve room for the 3D shadows.
+        Leave room for tile shadows.
     */
 
     const tileWidth =
@@ -581,24 +768,28 @@ function calculateBoardMetrics() {
         tileWidth * tileRatio;
 
     const visibleWidth =
-        layoutWidth * tileWidth;
+        logicalWidth *
+        tileWidth;
 
     const visibleHeight =
-        layoutHeight * tileWidth;
+        logicalHeight *
+        tileHeight;
 
     const offsetX =
         (
             boardWidth -
             visibleWidth
         ) / 2 -
-        minimumX * tileWidth;
+        minimumX *
+        tileWidth;
 
     const offsetY =
         (
             boardHeight -
             visibleHeight
         ) / 2 -
-        minimumY * tileWidth;
+        minimumY *
+        tileHeight;
 
     return {
         tileWidth,
@@ -610,125 +801,70 @@ function calculateBoardMetrics() {
     };
 }
 
-function addTileTouchHandler(
-    element,
-    tileId
-) {
-    let startX = 0;
-    let startY = 0;
-    let moved = false;
+// ============================================================
+// CREATE TILE ELEMENTS ONCE
+// ============================================================
 
-    const activate = event => {
-        if (moved) return;
+function createBoardElements() {
+    tileElements.clear();
+    board.replaceChildren();
 
-        event.preventDefault();
-        event.stopPropagation();
+    const fragment =
+        document.createDocumentFragment();
 
-        chooseTile(tileId);
-    };
-
-    if (window.PointerEvent) {
-        element.addEventListener(
-            "pointerdown",
-            event => {
-                startX = event.clientX;
-                startY = event.clientY;
-                moved = false;
-            },
-            {
-                passive: true
+    const sortedTiles =
+        [...tiles].sort(
+            (tileA, tileB) => {
+                return (
+                    tileA.z - tileB.z ||
+                    tileA.y - tileB.y ||
+                    tileA.x - tileB.x
+                );
             }
         );
 
-        element.addEventListener(
-            "pointermove",
-            event => {
-                const distance =
-                    Math.abs(
-                        event.clientX -
-                        startX
-                    ) +
-                    Math.abs(
-                        event.clientY -
-                        startY
-                    );
+    for (const tile of sortedTiles) {
+        const element =
+            document.createElement(
+                "button"
+            );
 
-                if (distance > 12) {
-                    moved = true;
-                }
-            },
-            {
-                passive: true
-            }
+        element.type = "button";
+
+        element.className =
+            `tile ${tile.colour}`;
+
+        element.dataset.id =
+            String(tile.id);
+
+        element.textContent =
+            tile.key;
+
+        element.tabIndex = -1;
+
+        tileElements.set(
+            tile.id,
+            element
         );
 
-        element.addEventListener(
-            "pointerup",
-            activate,
-            {
-                passive: false
-            }
-        );
-
-        element.addEventListener(
-            "pointercancel",
-            () => {
-                moved = true;
-            }
-        );
-    } else {
-        element.addEventListener(
-            "touchstart",
-            event => {
-                const touch =
-                    event.changedTouches[0];
-
-                startX = touch.clientX;
-                startY = touch.clientY;
-                moved = false;
-            },
-            {
-                passive: true
-            }
-        );
-
-        element.addEventListener(
-            "touchmove",
-            event => {
-                const touch =
-                    event.changedTouches[0];
-
-                const distance =
-                    Math.abs(
-                        touch.clientX -
-                        startX
-                    ) +
-                    Math.abs(
-                        touch.clientY -
-                        startY
-                    );
-
-                if (distance > 12) {
-                    moved = true;
-                }
-            },
-            {
-                passive: true
-            }
-        );
-
-        element.addEventListener(
-            "touchend",
-            activate,
-            {
-                passive: false
-            }
-        );
+        fragment.appendChild(element);
     }
+
+    board.appendChild(fragment);
+
+    positionBoardElements();
+    refreshFreeTileState();
+    updateCounters();
 }
 
-function renderBoard() {
-    if (!tiles.length) return;
+// ============================================================
+// POSITION EXISTING TILE ELEMENTS
+// ============================================================
+
+function positionBoardElements() {
+    if (!tiles.length) {
+        return;
+    }
 
     const metrics =
         calculateBoardMetrics();
@@ -748,48 +884,13 @@ function renderBoard() {
         `${metrics.tileWidth * 0.59}px`
     );
 
-    const fragment =
-        document.createDocumentFragment();
+    for (const tile of tiles) {
+        const element =
+            tileElements.get(tile.id);
 
-    const visibleTiles =
-        tiles
-            .filter(tile =>
-                !tile.removed
-            )
-            .sort((tileA, tileB) => {
-                return (
-                    tileA.z - tileB.z ||
-                    tileA.y - tileB.y ||
-                    tileA.x - tileB.x
-                );
-            });
-
-    visibleTiles.forEach(tile => {
-        const tileElement =
-            document.createElement(
-                "button"
-            );
-
-        const tileIsFree =
-            isTileFree(tile);
-
-        tileElement.type = "button";
-
-        tileElement.className = [
-            "tile",
-            tile.colour,
-            tileIsFree
-                ? "free"
-                : "blocked",
-            selectedTileId === tile.id
-                ? "selected"
-                : ""
-        ]
-            .filter(Boolean)
-            .join(" ");
-
-        tileElement.dataset.id =
-            String(tile.id);
+        if (!element) {
+            continue;
+        }
 
         const left =
             metrics.offsetX +
@@ -809,13 +910,13 @@ function renderBoard() {
             ) *
             metrics.tileHeight;
 
-        tileElement.style.left =
+        element.style.left =
             `${left}px`;
 
-        tileElement.style.top =
+        element.style.top =
             `${top}px`;
 
-        tileElement.style.zIndex =
+        element.style.zIndex =
             String(
                 100 +
                 tile.z * 100 +
@@ -824,75 +925,81 @@ function renderBoard() {
                 ) +
                 Math.round(tile.x)
             );
-
-        tileElement.textContent =
-            tile.key;
-
-        tileElement.setAttribute(
-            "aria-label",
-            `${
-                tileIsFree
-                    ? "Free"
-                    : "Blocked"
-            } Mahjong tile`
-        );
-
-        addTileTouchHandler(
-            tileElement,
-            tile.id
-        );
-
-        fragment.appendChild(
-            tileElement
-        );
-    });
-
-    board.replaceChildren(fragment);
-
-    const remaining =
-        tiles.filter(tile =>
-            !tile.removed
-        ).length;
-
-    tilesLeftElement.textContent =
-        String(remaining);
-
-    movesElement.textContent =
-        `Moves: ${history.length}`;
+    }
 }
 
-function chooseTile(tileId) {
-    if (boardLocked) return;
+// ============================================================
+// SELECTION
+// ============================================================
+
+function clearSelection() {
+    if (selectedTileId !== null) {
+        const oldElement =
+            tileElements.get(
+                selectedTileId
+            );
+
+        if (oldElement) {
+            oldElement.classList.remove(
+                "selected"
+            );
+        }
+    }
+
+    selectedTileId = null;
+}
+
+function selectTile(tileId) {
+    if (boardLocked) {
+        return;
+    }
 
     const chosenTile =
         tiles[tileId];
 
-    if (!isTileFree(chosenTile)) {
-        statusElement.textContent =
-            "That tile is covered or blocked on both sides.";
+    if (
+        !chosenTile ||
+        chosenTile.removed
+    ) {
+        return;
+    }
+
+    if (
+        !freeTileIds.has(tileId)
+    ) {
+        setStatus(
+            "That tile is covered or blocked on both sides."
+        );
 
         playTone(180);
         return;
     }
 
+    const chosenElement =
+        tileElements.get(tileId);
+
     if (selectedTileId === null) {
         selectedTileId = tileId;
 
-        statusElement.textContent =
-            "Now choose its matching free tile.";
+        chosenElement.classList.add(
+            "selected"
+        );
+
+        setStatus(
+            "Now choose its matching free tile."
+        );
 
         playTone(430);
-        renderBoard();
         return;
     }
 
     if (selectedTileId === tileId) {
-        selectedTileId = null;
+        clearSelection();
 
-        statusElement.textContent =
-            "Selection cleared.";
+        setStatus(
+            "Selection cleared."
+        );
 
-        renderBoard();
         return;
     }
 
@@ -905,39 +1012,66 @@ function chooseTile(tileId) {
             chosenTile
         )
     ) {
+        const previousElement =
+            tileElements.get(
+                selectedTileId
+            );
+
+        if (previousElement) {
+            previousElement.classList.remove(
+                "selected"
+            );
+        }
+
         selectedTileId = tileId;
 
-        statusElement.textContent =
-            "Not a match. The new tile is selected.";
+        chosenElement.classList.add(
+            "selected"
+        );
+
+        setStatus(
+            "Not a match. The new tile is selected."
+        );
 
         playTone(220);
-        renderBoard();
         return;
     }
 
-    removePair(
+    removeMatchingPair(
         firstTile,
         chosenTile
     );
 }
 
-function removePair(
+// ============================================================
+// REMOVE PAIR
+// ============================================================
+
+function removeMatchingPair(
     firstTile,
     secondTile
 ) {
     boardLocked = true;
 
-    const selector =
-        `[data-id="${firstTile.id}"],` +
-        `[data-id="${secondTile.id}"]`;
+    const firstElement =
+        tileElements.get(firstTile.id);
 
-    document
-        .querySelectorAll(selector)
-        .forEach(element => {
-            element.classList.add(
-                "removing"
-            );
-        });
+    const secondElement =
+        tileElements.get(secondTile.id);
+
+    firstElement.classList.remove(
+        "selected"
+    );
+
+    firstElement.classList.add(
+        "removing"
+    );
+
+    secondElement.classList.add(
+        "removing"
+    );
+
+    selectedTileId = null;
 
     playTone(720);
 
@@ -950,66 +1084,94 @@ function removePair(
             secondTile.id
         ]);
 
-        selectedTileId = null;
+        firstElement.hidden = true;
+        secondElement.hidden = true;
+
+        firstElement.classList.remove(
+            "removing"
+        );
+
+        secondElement.classList.remove(
+            "removing"
+        );
+
         boardLocked = false;
 
-        renderBoard();
+        refreshFreeTileState();
+        updateCounters();
 
-        const remaining =
-            tiles.filter(tile =>
-                !tile.removed
-            ).length;
+        const remainingTiles =
+            tiles.length -
+            history.length * 2;
 
-        if (remaining === 0) {
+        if (remainingTiles === 0) {
             winText.textContent =
                 `You completed Cathy's Mahjong in ${history.length} moves.`;
 
             winWindow.hidden = false;
+
             playTone(920);
             return;
         }
 
-        if (findLegalMoves().length === 0) {
-            statusElement.textContent =
-                "Dead end. Undo a move or restart this deal.";
+        if (
+            findLegalMoves().length === 0
+        ) {
+            setStatus(
+                "Dead end. Undo a move or restart this deal."
+            );
 
             return;
         }
 
-        statusElement.textContent =
-            `Good match. ${remaining} tiles remain.`;
-    }, 250);
+        setStatus(
+            `Good match. ${remainingTiles} tiles remain.`
+        );
+    }, 180);
 }
 
+// ============================================================
+// FIND LEGAL MATCHES
+// ============================================================
+
 function findLegalMoves() {
-    const freeTiles =
-        tiles.filter(tile =>
-            isTileFree(tile)
-        );
+    const availableTiles = [];
+
+    for (const tileId of freeTileIds) {
+        const tile = tiles[tileId];
+
+        if (
+            tile &&
+            !tile.removed
+        ) {
+            availableTiles.push(tile);
+        }
+    }
 
     const moves = [];
 
     for (
         let firstIndex = 0;
-        firstIndex < freeTiles.length;
+        firstIndex <
+        availableTiles.length;
         firstIndex += 1
     ) {
         for (
             let secondIndex =
                 firstIndex + 1;
             secondIndex <
-                freeTiles.length;
+            availableTiles.length;
             secondIndex += 1
         ) {
             if (
                 tilesMatch(
-                    freeTiles[firstIndex],
-                    freeTiles[secondIndex]
+                    availableTiles[firstIndex],
+                    availableTiles[secondIndex]
                 )
             ) {
                 moves.push([
-                    freeTiles[firstIndex],
-                    freeTiles[secondIndex]
+                    availableTiles[firstIndex],
+                    availableTiles[secondIndex]
                 ]);
             }
         }
@@ -1018,21 +1180,33 @@ function findLegalMoves() {
     return moves;
 }
 
-function showHint() {
+// ============================================================
+// SAFE HINT
+// ============================================================
+
+function showSafeHint() {
+    if (boardLocked) {
+        return;
+    }
+
     let hintPair = null;
 
-    for (const ids of solution) {
+    for (const pairIds of solution) {
         const firstTile =
-            tiles[ids[0]];
+            tiles[pairIds[0]];
 
         const secondTile =
-            tiles[ids[1]];
+            tiles[pairIds[1]];
 
         if (
             !firstTile.removed &&
             !secondTile.removed &&
-            isTileFree(firstTile) &&
-            isTileFree(secondTile) &&
+            freeTileIds.has(
+                firstTile.id
+            ) &&
+            freeTileIds.has(
+                secondTile.id
+            ) &&
             tilesMatch(
                 firstTile,
                 secondTile
@@ -1054,96 +1228,138 @@ function showHint() {
     }
 
     if (!hintPair) {
-        statusElement.textContent =
-            "No move is available. Use Undo.";
+        setStatus(
+            "No move is available. Use Undo."
+        );
 
+        playTone(180);
         return;
     }
 
-    const selector =
-        `[data-id="${hintPair[0].id}"],` +
-        `[data-id="${hintPair[1].id}"]`;
+    for (const tile of hintPair) {
+        const element =
+            tileElements.get(tile.id);
 
-    document
-        .querySelectorAll(selector)
-        .forEach(element => {
-            element.classList.remove(
-                "hint"
-            );
+        element.classList.remove(
+            "hint"
+        );
 
-            void element.offsetWidth;
+        void element.offsetWidth;
 
-            element.classList.add(
-                "hint"
-            );
-        });
+        element.classList.add(
+            "hint"
+        );
+    }
 
-    statusElement.textContent =
-        "The highlighted tiles are a safe matching pair.";
+    setStatus(
+        "The highlighted tiles are a safe matching pair."
+    );
 }
 
+// ============================================================
+// UNDO
+// ============================================================
+
 function undoLastMove() {
-    if (boardLocked) return;
+    if (boardLocked) {
+        return;
+    }
 
     const previousPair =
         history.pop();
 
     if (!previousPair) {
-        statusElement.textContent =
-            "There is nothing to undo.";
+        setStatus(
+            "There is nothing to undo."
+        );
 
         return;
     }
 
-    previousPair.forEach(tileId => {
-        tiles[tileId].removed = false;
-    });
+    clearSelection();
 
-    selectedTileId = null;
+    for (const tileId of previousPair) {
+        const tile =
+            tiles[tileId];
 
-    statusElement.textContent =
-        "The last pair has been restored.";
+        const element =
+            tileElements.get(tileId);
 
-    renderBoard();
+        tile.removed = false;
+        element.hidden = false;
+    }
+
+    refreshFreeTileState();
+    updateCounters();
+
+    setStatus(
+        "The last matching pair has been restored."
+    );
 }
 
+// ============================================================
+// NEW DEAL
+// ============================================================
+
 function startNewDeal() {
-    if (boardLocked) return;
+    if (boardLocked) {
+        return;
+    }
 
     boardLocked = true;
 
-    statusElement.textContent =
-        "Preparing a new deal…";
+    setStatus(
+        "Preparing a solvable deal…"
+    );
 
     /*
-        Let Safari draw the message first.
+        Yield to Safari before building the deal,
+        allowing the status message to appear.
     */
 
     window.requestAnimationFrame(() => {
         try {
             tiles = createDeal();
+
             history = [];
             selectedTileId = null;
+
             winWindow.hidden = true;
+
+            createBoardElements();
+
             boardLocked = false;
 
-            statusElement.textContent =
-                "New solvable deal ready. Choose a bright free tile.";
-
-            renderBoard();
+            setStatus(
+                "New solvable deal ready. Choose a bright free tile."
+            );
         } catch (error) {
             boardLocked = false;
 
             console.error(error);
 
-            statusElement.textContent =
-                "The board could not be prepared. Press New deal again.";
+            setStatus(
+                "The deal could not be prepared. Press New deal again."
+            );
         }
     });
 }
 
+// ============================================================
+// RESTART SAME DEAL
+// ============================================================
+
 function restartSameDeal() {
-    if (!tiles.length) return;
+    if (
+        boardLocked ||
+        !tiles.length
+    ) {
+        return;
+    }
+
+    clearSelection();
+
+    history = [];
 
     tiles.forEach(
         (tile, index) => {
@@ -1153,19 +1369,124 @@ function restartSameDeal() {
                 tile,
                 originalTileTypes[index]
             );
+
+            const element =
+                tileElements.get(tile.id);
+
+            element.hidden = false;
+
+            element.className =
+                `tile ${tile.colour}`;
+
+            element.textContent =
+                tile.key;
         }
     );
 
-    history = [];
-    selectedTileId = null;
-    boardLocked = false;
     winWindow.hidden = true;
 
-    statusElement.textContent =
-        "The same deal has restarted.";
+    refreshFreeTileState();
+    updateCounters();
 
-    renderBoard();
+    setStatus(
+        "The same deal has restarted."
+    );
 }
+
+// ============================================================
+// BOARD TOUCH HANDLING
+// ============================================================
+
+function activateBoardTile(event) {
+    const tileElement =
+        event.target.closest(".tile");
+
+    if (
+        !tileElement ||
+        !board.contains(tileElement)
+    ) {
+        return;
+    }
+
+    event.preventDefault();
+
+    const tileId =
+        Number(tileElement.dataset.id);
+
+    if (
+        Number.isInteger(tileId)
+    ) {
+        selectTile(tileId);
+    }
+}
+
+/*
+    Modern iPads support pointer events. The touch
+    fallback supports older Safari versions.
+*/
+
+if (window.PointerEvent) {
+    board.addEventListener(
+        "pointerup",
+        event => {
+            lastPointerTime =
+                Date.now();
+
+            activateBoardTile(event);
+        },
+        {
+            passive: false
+        }
+    );
+} else {
+    board.addEventListener(
+        "touchend",
+        event => {
+            lastPointerTime =
+                Date.now();
+
+            activateBoardTile(event);
+        },
+        {
+            passive: false
+        }
+    );
+}
+
+/*
+    Mouse and keyboard fallback. Ignore any synthetic
+    click immediately following a touch or pointer event.
+*/
+
+board.addEventListener(
+    "click",
+    event => {
+        if (
+            Date.now() -
+            lastPointerTime <
+            700
+        ) {
+            return;
+        }
+
+        activateBoardTile(event);
+    }
+);
+
+board.addEventListener(
+    "contextmenu",
+    event => {
+        if (
+            event.target.closest(".tile")
+        ) {
+            event.preventDefault();
+        }
+    }
+);
+
+// ============================================================
+// CONTROL BUTTONS
+// ============================================================
 
 newGameButton.addEventListener(
     "click",
@@ -1174,7 +1495,7 @@ newGameButton.addEventListener(
 
 hintButton.addEventListener(
     "click",
-    showHint
+    showSafeHint
 );
 
 undoButton.addEventListener(
@@ -1192,9 +1513,17 @@ playAgainButton.addEventListener(
     startNewDeal
 );
 
+soundButton.textContent =
+    "Sound off";
+
+soundButton.setAttribute(
+    "aria-pressed",
+    "false"
+);
+
 soundButton.addEventListener(
     "click",
-    event => {
+    async event => {
         soundEnabled =
             !soundEnabled;
 
@@ -1207,8 +1536,31 @@ soundButton.addEventListener(
             "aria-pressed",
             String(soundEnabled)
         );
+
+        if (soundEnabled) {
+            const context =
+                getAudioContext();
+
+            if (
+                context &&
+                context.state ===
+                "suspended"
+            ) {
+                try {
+                    await context.resume();
+                } catch (error) {
+                    // Continue without sound.
+                }
+            }
+
+            playTone(520);
+        }
     }
 );
+
+// ============================================================
+// RESIZE AND ORIENTATION
+// ============================================================
 
 window.addEventListener(
     "resize",
@@ -1219,7 +1571,7 @@ window.addEventListener(
 
         resizeTimer =
             window.setTimeout(
-                renderBoard,
+                positionBoardElements,
                 100
             );
     }
@@ -1229,22 +1581,64 @@ window.addEventListener(
     "orientationchange",
     () => {
         window.setTimeout(
-            renderBoard,
-            250
+            positionBoardElements,
+            300
         );
     }
 );
 
-document.addEventListener(
-    "contextmenu",
-    event => {
-        if (
-            event.target.closest(".tile")
-        ) {
-            event.preventDefault();
-        }
-    }
-);
+// ============================================================
+// REMOVE OLD SERVICE WORKER AND CACHES
+// ============================================================
 
-removeOldOfflineCache();
+async function removeOldGameCache() {
+    try {
+        if (
+            "serviceWorker" in navigator
+        ) {
+            const registrations =
+                await navigator
+                    .serviceWorker
+                    .getRegistrations();
+
+            for (
+                const registration
+                of registrations
+            ) {
+                await registration.unregister();
+            }
+        }
+
+        if ("caches" in window) {
+            const cacheNames =
+                await caches.keys();
+
+            for (
+                const cacheName
+                of cacheNames
+            ) {
+                if (
+                    cacheName
+                        .toLowerCase()
+                        .includes("mahjong")
+                ) {
+                    await caches.delete(
+                        cacheName
+                    );
+                }
+            }
+        }
+    } catch (error) {
+        console.warn(
+            "Old cache cleanup was skipped:",
+            error
+        );
+    }
+}
+
+// ============================================================
+// START
+// ============================================================
+
+removeOldGameCache();
 startNewDeal();
