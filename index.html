@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#103a32">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Cathy's Mahjong">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css?v=1">
+  <title>Cathy's Mahjong</title>
+</head>
+<body>
+<main class="app">
+  <header><div><h1>Cathy's Mahjong</h1><p>Clear the layered board two free tiles at a time</p></div><div class="counter"><strong id="tilesLeft">144</strong><span>tiles left</span></div></header>
+  <nav><button id="newGame" type="button">New deal</button><button id="hint" type="button">Safe hint</button><button id="undo" type="button">Undo</button><button id="sameDeal" type="button">Restart deal</button><button id="sound" type="button" aria-pressed="true">Sound on</button></nav>
+  <div class="status"><span id="status" aria-live="polite">Preparing a solvable deal…</span><span id="moves">Moves: 0</span></div>
+  <section id="boardWrap"><div id="board" aria-label="Layered Mahjong board"></div></section>
+  <p class="rules">A tile is free when nothing covers it and either its left or right side is open. Every new deal starts with a complete solution. Undo or use Safe hint if a choice creates a dead end.</p>
+</main>
+<div id="win" class="modal" hidden><div><b>COMPLETE</b><h2>Board cleared!</h2><p id="winText"></p><button id="again" type="button">Play another deal</button></div></div>
+<script src="app.js?v=1" defer></script>
+</body></html>
